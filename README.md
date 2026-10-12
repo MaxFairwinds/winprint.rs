@@ -60,3 +60,27 @@ Licensed under [BSD 3 Clause](./LICENSE.md)
 
 ### Contribution
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate by you, shall be licensed as BSD 3 Clause, without any additional terms or conditions.
+
+## Craft Apps maintenance branch
+
+This branch retains the upstream BSD-3-Clause licence and copyright notices.
+It is based on ArcticLampyrid/winprint.rs v0.2.1, commit
+`406ed733f15d60403d8d029035c807b5d8d33d31`.
+
+The narrow changes used by craft-print are:
+
+- DXGI jobs retain the terminal package HRESULT, report failed/canceled states, and
+  time out after two minutes waiting for a missing terminal notification after Close.
+  An unsuccessful job requests cancellation; the status connection is unadvised
+  before its COM apartment is released. The timeout does not bound calls into a
+  printer driver or an interactive output-file dialog.
+- `WinPdfPrinter::print_with_progress(path, ticket, callback)` reports `(processed,
+  total)` after each successful Direct2D AddPage, preserving one job and its ticket.
+  These counts measure page processing, never physical printing or terminal success.
+  Existing `FilePrinter::print` remains a wrapper without progress.
+- Completion regression tests cover a late failed HRESULT, cancellation, inconsistent
+  completed HRESULT, missing notification, and repeated terminal notifications.
+
+The shared completion state uses reference-counted Rust synchronization rather than
+an event HANDLE borrowed from the callback's lifetime. Applications must still check
+that printing's final Result is successful, even when progress reached its total.

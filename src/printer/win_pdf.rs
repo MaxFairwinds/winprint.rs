@@ -44,11 +44,23 @@ impl WinPdfPrinter {
 impl FilePrinter for WinPdfPrinter {
     type Options = PrintTicket;
     type Error = WinPdfPrinterError;
-    fn print(
+    fn print(&self, path: &Path, options: PrintTicket) -> Result<(), WinPdfPrinterError> {
+        self.print_with_progress(path, options, |_, _| {})
+    }
+}
+
+impl WinPdfPrinter {
+    /// Print one PDF as one job, reporting each page after Direct2D accepts it.
+    ///
+    /// Counts describe pages processed, not physical output or terminal spooler success.
+    /// The final result still reports cancellation/failure even after every page was accepted.
+    /// The callback runs synchronously on the calling thread; it does not require `Send`.
+    pub fn print_with_progress(
         &self,
         path: &Path,
         options: PrintTicket,
-    ) -> std::result::Result<(), WinPdfPrinterError> {
+        mut progress: impl FnMut(u32, u32),
+    ) -> Result<(), WinPdfPrinterError> {
         let context = DxgiPrintContext::new(
             &self.printer,
             &options,
@@ -106,6 +118,7 @@ impl FilePrinter for WinPdfPrinter {
                 print_control
                     .AddPage(&command_list, dx_size, None, None, None)
                     .map_err(WinPdfPrinterError::RenderError)?;
+                progress(i + 1, page_count);
             }
         }
         context.close_and_wait()?;
