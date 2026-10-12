@@ -90,6 +90,7 @@ impl WinPdfPrinter {
             let page_count = pdf_document
                 .PageCount()
                 .map_err(WinPdfPrinterError::RenderError)?;
+            progress(0, page_count);
             for i in 0..page_count {
                 let pdf_page = pdf_document
                     .GetPage(i)
