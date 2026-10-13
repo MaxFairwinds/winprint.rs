@@ -116,9 +116,12 @@ impl DevMode {
             .get(72..76)
             .and_then(|b| <[u8; 4]>::try_from(b).ok())
             .map(u32::from_le_bytes);
-        fields.is_some_and(|f| f & 0x100 != 0)
-            && self.0.get(86..88) == Some(1i16.to_le_bytes().as_slice())
-            && self.0.get(100..102) == Some(0i16.to_le_bytes().as_slice())
+        // dmFields identifies valid fields. A driver without hardware copies/collation may
+        // clear their flags and return unspecified values; those cannot multiply our pages.
+        fields.is_some_and(|f| {
+            (f & 0x100 == 0 || self.0.get(86..88) == Some(1i16.to_le_bytes().as_slice()))
+                && (f & 0x8000 == 0 || self.0.get(100..102) == Some(0i16.to_le_bytes().as_slice()))
+        })
     }
 
     /// Hex, for JSON parameters and remembered print settings.
@@ -386,6 +389,7 @@ mod tests {
     #[test]
     fn manual_copies_disable_driver_multiplication_without_losing_private_settings() {
         let mut bytes = devmode(220, 32);
+        bytes[72..76].copy_from_slice(&0x8100u32.to_le_bytes());
         bytes[86..88].copy_from_slice(&7i16.to_le_bytes());
         bytes[100..102].copy_from_slice(&1i16.to_le_bytes());
         bytes[220..].fill(0x5a);
@@ -397,9 +401,18 @@ mod tests {
         assert_eq!(normalized.for_manual_copies().unwrap(), normalized);
         let mut ignored = normalized.as_bytes().to_vec();
         ignored[72..76].copy_from_slice(&0u32.to_le_bytes());
+        ignored[86..88].copy_from_slice(&0i16.to_le_bytes());
+        ignored[100..102].copy_from_slice(&1i16.to_le_bytes());
+        assert!(
+            DevMode::from_bytes(ignored.clone())
+                .unwrap()
+                .has_manual_copies(),
+            "drivers may omit unsupported copy/collation fields"
+        );
+        ignored[72..76].copy_from_slice(&0x8100u32.to_le_bytes());
         assert!(
             !DevMode::from_bytes(ignored).unwrap().has_manual_copies(),
-            "a driver must advertise that it accepts dmCopies"
+            "active driver fields must retain our copy policy"
         );
     }
 

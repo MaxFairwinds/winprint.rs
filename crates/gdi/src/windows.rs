@@ -240,6 +240,15 @@ impl Dc {
             })?),
             None => None,
         };
+        #[cfg(test)]
+        if manual_copies && let Some(dm) = &merged {
+            eprintln!(
+                "validated driver copy fields: flags={:?} copies={:?} collate={:?}",
+                dm.as_bytes().get(72..76),
+                dm.as_bytes().get(86..88),
+                dm.as_bytes().get(100..102)
+            );
+        }
         if manual_copies && !merged.as_ref().is_some_and(DevMode::has_manual_copies) {
             return Err(PrintError::Invalid(
                 "the driver refused single-copy settings; no print job was sent".into(),
