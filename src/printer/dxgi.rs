@@ -37,8 +37,8 @@ use windows::Win32::Storage::Xps::Printing::IPrintDocumentPackageTarget;
 use windows::Win32::Storage::Xps::Printing::IPrintDocumentPackageTargetFactory;
 use windows::Win32::Storage::Xps::Printing::PrintDocumentPackageTargetFactory;
 use windows::Win32::System::Com::CoCreateInstance;
-use windows::Win32::System::Com::IConnectionPointContainer;
 use windows::Win32::System::Com::CLSCTX_ALL;
+use windows::Win32::System::Com::{IConnectionPoint, IConnectionPointContainer};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 
 #[derive(Error, Debug)]
@@ -59,6 +59,9 @@ pub enum DxgiPrintContextError {
     /// Stream not allocated.
     #[error("Stream not allocated")]
     StreamNotAllocated,
+    /// The spooler reported failure/cancellation, or did not finish within two minutes.
+    #[error("Print job failed, was canceled, or timed out")]
+    CompletionFailed(#[source] windows::core::Error),
     /// Failed to close print control.
     #[error("Failed to close print control")]
     FailedToClosePrintControl(#[source] windows::core::Error),
@@ -80,6 +83,9 @@ pub struct DxgiPrintContext {
     pub document_target: IPrintDocumentPackageTarget,
     pub print_control: ID2D1PrintControl,
     pub completion_waiter: PrintCompletionWaiter,
+    status_connection: IConnectionPoint,
+    status_cookie: u32,
+    completed: bool,
     // The last field will be dropped last, according to the drop order.
     _com_initializer: ComInitializer,
 }
@@ -194,8 +200,10 @@ impl DxgiPrintContext {
             let cpc: IConnectionPointContainer = document_target
                 .cast()
                 .map_err(DxgiPrintContextError::FailedToCreateEvent)?;
-            cpc.FindConnectionPoint(&IPrintDocumentPackageStatusEvent::IID)
-                .map_err(DxgiPrintContextError::FailedToCreateEvent)?
+            let status_connection = cpc
+                .FindConnectionPoint(&IPrintDocumentPackageStatusEvent::IID)
+                .map_err(DxgiPrintContextError::FailedToCreateEvent)?;
+            let status_cookie = status_connection
                 .Advise(&completion_source)
                 .map_err(DxgiPrintContextError::FailedToCreateEvent)?;
 
@@ -211,20 +219,40 @@ impl DxgiPrintContext {
                 document_target,
                 print_control,
                 completion_waiter,
+                status_connection,
+                status_cookie,
+                completed: false,
                 _com_initializer,
             })
         }
     }
 
     /// Close the print context and wait for the completion of the print job.
-    pub fn close_and_wait(self) -> Result<(), DxgiPrintContextError> {
+    pub fn close_and_wait(mut self) -> Result<(), DxgiPrintContextError> {
         unsafe {
             self.print_control
                 .Close()
                 .map(|_| ())
                 .map_err(DxgiPrintContextError::FailedToClosePrintControl)?;
         }
-        self.completion_waiter.wait();
+        self.completion_waiter
+            .wait()
+            .map_err(DxgiPrintContextError::CompletionFailed)?;
+        self.completed = true;
         Ok(())
+    }
+}
+
+impl Drop for DxgiPrintContext {
+    fn drop(&mut self) {
+        unsafe {
+            // A render/Close/terminal error must not leave an incomplete job behind. Cancel
+            // is best effort: report the original failure so callers do not assume success.
+            if !self.completed {
+                let _ = self.document_target.Cancel();
+            }
+            // Release the event sink while the COM apartment is still initialized.
+            let _ = self.status_connection.Unadvise(self.status_cookie);
+        }
     }
 }
