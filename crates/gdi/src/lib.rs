@@ -290,6 +290,22 @@ pub fn default_settings(printer: &str) -> Result<DevMode> {
     }
 }
 
+/// The signed-in user's own settings for `printer`: what they saved in its Printing Preferences
+/// (GetPrinter level 9), settled by the driver, else the printer's defaults. Programs such as
+/// Acrobat print with these; the printer's Printing Defaults can hold another stock, darkness
+/// or cutter setting. Level 9 is only served to an interactive session.
+pub fn user_settings(printer: &str) -> Result<DevMode> {
+    #[cfg(windows)]
+    {
+        windows::user_settings(printer)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = printer;
+        Err(PrintError::Unsupported)
+    }
+}
+
 /// Shows the driver's Print Settings dialog (modal; `parent` is a window handle). `None` when
 /// the user cancels.
 pub fn settings_dialog(
@@ -323,23 +339,46 @@ pub fn page(printer: &str, settings: Option<&DevMode>) -> Result<Page> {
 
 /// Prints `image` into `rect` (points, origin top-left of the sheet), `job.copies` pages.
 pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) -> Result<Printed> {
-    let row = (image.width as usize)
-        .checked_mul(3)
-        .ok_or_else(|| PrintError::Invalid("image too large".into()))?;
-    if image.width == 0
-        || image.height == 0
-        || row.checked_mul(image.height as usize) != Some(image.data.len())
-    {
+    print_pages(job, &[(image, rect)])
+}
+
+/// One page of a [`print_pages`] job: the picture and where it goes on the sheet (points, origin
+/// top-left: x, y, width, height).
+pub type PagePicture<'a, 'b> = (&'a RgbImage<'b>, (f64, f64, f64, f64));
+
+/// The most pages one [`print_pages`] job takes.
+pub const MAX_PAGES: usize = 10_000;
+
+/// Prints each `(image, rect)` as one page of a single job (rect in points, origin top-left of the
+/// sheet), the whole set `job.copies` times. An image whose pixels are exactly the device pixels
+/// of its rect (rendered at the printer's resolution) is copied pixel for pixel; a scaled one is
+/// resampled with halftoning. Copying matters on thermal label printers: their drivers dither
+/// any grey, and resampling a black-and-white picture makes greys at every edge.
+pub fn print_pages(job: &Job<'_>, pages: &[PagePicture<'_, '_>]) -> Result<Printed> {
+    if pages.is_empty() || pages.len() > MAX_PAGES {
         return Err(PrintError::Invalid("nothing to print".into()));
     }
-    if ![rect.0, rect.1, rect.2, rect.3]
-        .iter()
-        .all(|v| v.is_finite())
-        || !(rect.2 > 0.0 && rect.3 > 0.0)
-    {
-        return Err(PrintError::Invalid("the print size is empty".into()));
+    let mut total = 0usize;
+    for (image, rect) in pages {
+        let row = (image.width as usize)
+            .checked_mul(3)
+            .ok_or_else(|| PrintError::Invalid("image too large".into()))?;
+        if image.width == 0
+            || image.height == 0
+            || row.checked_mul(image.height as usize) != Some(image.data.len())
+        {
+            return Err(PrintError::Invalid("nothing to print".into()));
+        }
+        if ![rect.0, rect.1, rect.2, rect.3]
+            .iter()
+            .all(|v| v.is_finite())
+            || !(rect.2 > 0.0 && rect.3 > 0.0)
+        {
+            return Err(PrintError::Invalid("the print size is empty".into()));
+        }
+        total = total.saturating_add(image.data.len());
     }
-    if image.data.len() > 512 * 1024 * 1024
+    if total > 512 * 1024 * 1024
         || job.primitives.len() > 10_000
         || job.primitives.iter().any(|p| !p.valid())
     {
@@ -349,13 +388,18 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
     }
     #[cfg(windows)]
     {
-        windows::print(job, image, rect)
+        windows::print(job, pages)
     }
     #[cfg(not(windows))]
     {
         let _ = job;
         Err(PrintError::Unsupported)
     }
+}
+
+/// Whether an image drawn at `device` (width, height in device pixels) needs no resampling.
+pub fn is_device_size(image: &RgbImage<'_>, device: (i32, i32)) -> bool {
+    i64::from(image.width) == i64::from(device.0) && i64::from(image.height) == i64::from(device.1)
 }
 
 #[cfg(test)]
@@ -414,6 +458,60 @@ mod tests {
             !DevMode::from_bytes(ignored).unwrap().has_manual_copies(),
             "active driver fields must retain our copy policy"
         );
+    }
+
+    #[test]
+    fn only_a_picture_at_the_device_pixels_counts_as_device_size() {
+        let data = vec![255u8; 4 * 2 * 3];
+        let image = RgbImage {
+            width: 4,
+            height: 2,
+            data: &data,
+        };
+        assert!(is_device_size(&image, (4, 2)));
+        assert!(
+            !is_device_size(&image, (4, 3))
+                && !is_device_size(&image, (8, 4))
+                && !is_device_size(&image, (-4, 2))
+        );
+    }
+
+    #[test]
+    fn a_multi_page_job_checks_every_page() {
+        let job = Job {
+            printer: "none",
+            settings: None,
+            title: "t",
+            output_file: None,
+            copies: 1,
+            color_policy: ColorPolicy::Unmanaged,
+            primitives: &[],
+        };
+        let good = vec![0u8; 2 * 2 * 3];
+        let bad = vec![0u8; 5];
+        let ok = RgbImage {
+            width: 2,
+            height: 2,
+            data: &good,
+        };
+        let broken = RgbImage {
+            width: 2,
+            height: 2,
+            data: &bad,
+        };
+        let rect = (0.0, 0.0, 72.0, 72.0);
+        assert!(matches!(
+            print_pages(&job, &[]),
+            Err(PrintError::Invalid(_))
+        ));
+        assert!(matches!(
+            print_pages(&job, &[(&ok, rect), (&broken, rect)]),
+            Err(PrintError::Invalid(_))
+        ));
+        assert!(matches!(
+            print_pages(&job, &[(&ok, (0.0, 0.0, 0.0, 72.0))]),
+            Err(PrintError::Invalid(_))
+        ));
     }
 
     #[test]

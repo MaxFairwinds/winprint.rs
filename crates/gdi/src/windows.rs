@@ -7,15 +7,16 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDCW, CreatePen, DEVMODEW, DIB_RGB_COLORS,
-    DM_IN_BUFFER, DM_IN_PROMPT, DM_OUT_BUFFER, DeleteDC, DeleteObject, Ellipse, GetDeviceCaps,
-    GetStockObject, HALFTONE, HDC, HOLLOW_BRUSH, HORZRES, LOGPIXELSX, LOGPIXELSY, LineTo, MoveToEx,
-    PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY, PHYSICALWIDTH, PS_SOLID, SRCCOPY,
-    SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, VERTRES,
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, COLORONCOLOR, CreateDCW, CreatePen, DEVMODEW,
+    DIB_RGB_COLORS, DM_IN_BUFFER, DM_IN_PROMPT, DM_OUT_BUFFER, DeleteDC, DeleteObject, Ellipse,
+    GetDeviceCaps, GetStockObject, HALFTONE, HDC, HOLLOW_BRUSH, HORZRES, LOGPIXELSX, LOGPIXELSY,
+    LineTo, MoveToEx, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY, PHYSICALWIDTH, PS_SOLID,
+    SRCCOPY, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, VERTRES,
 };
 use windows_sys::Win32::Graphics::Printing::{
-    ClosePrinter, DocumentPropertiesW, EnumPrintersW, GetDefaultPrinterW, OpenPrinterW,
-    PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL, PRINTER_HANDLE, PRINTER_INFO_4W,
+    ClosePrinter, DocumentPropertiesW, EnumPrintersW, GetDefaultPrinterW, GetPrinterW,
+    OpenPrinterW, PRINTER_ENUM_CONNECTIONS, PRINTER_ENUM_LOCAL, PRINTER_HANDLE, PRINTER_INFO_4W,
+    PRINTER_INFO_9W,
 };
 use windows_sys::Win32::Storage::Xps::{AbortDoc, DOCINFOW, EndDoc, EndPage, StartDocW, StartPage};
 use windows_sys::Win32::UI::ColorSystem::{ICM_DONE_OUTSIDEDC, ICM_OFF, SetICMMode};
@@ -210,6 +211,50 @@ pub fn properties(
         IDCANCEL => Ok(None),
         _ => Err(last_error("the printer's settings dialog")),
     }
+}
+
+pub fn user_settings(printer: &str) -> Result<DevMode> {
+    let per_user = {
+        let name = wide(printer)?;
+        let p = OpenPrinter::open(&name)?;
+        let mut needed = 0u32;
+        // SAFETY: a size query (null buffer, 0 bytes) on a valid printer handle.
+        unsafe { GetPrinterW(p.0, 9, null_mut(), 0, &mut needed) };
+        let bytes = needed as usize;
+        if bytes >= std::mem::size_of::<PRINTER_INFO_9W>() && bytes <= (1 << 20) {
+            let mut buf = aligned(bytes);
+            // SAFETY: `buf` holds `needed` aligned writable bytes as the size query asked for.
+            let ok =
+                unsafe { GetPrinterW(p.0, 9, buf.as_mut_ptr().cast(), needed, &mut needed) } != 0;
+            if ok {
+                // SAFETY: on success the buffer starts with a PRINTER_INFO_9W (aligned buffer).
+                let dm = unsafe { (*buf.as_ptr().cast::<PRINTER_INFO_9W>()).pDevMode };
+                if dm.is_null() {
+                    None
+                } else {
+                    // SAFETY: a non-null pDevMode points into `buf` at a DEVMODEW the spooler
+                    // wrote; its dmSize and dmDriverExtra say how many bytes it has.
+                    let (size, extra) =
+                        unsafe { (usize::from((*dm).dmSize), usize::from((*dm).dmDriverExtra)) };
+                    let base = buf.as_ptr() as usize;
+                    let at = dm as usize;
+                    let all = bytes_of(&buf, bytes);
+                    at.checked_sub(base)
+                        .and_then(|off| all.get(off..off.checked_add(size + extra)?))
+                        .and_then(|b| DevMode::from_bytes(b.to_vec()).ok())
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    match per_user {
+        Some(d) => properties(printer, Some(&d), None, false)?,
+        None => properties(printer, None, None, false)?,
+    }
+    .ok_or_else(|| PrintError::System("the printer driver gave no settings".into()))
 }
 
 /// A printer device context, deleted on drop.
@@ -423,14 +468,16 @@ fn draw_primitives(dc: HDC, primitives: &[Primitive], page: &Page) -> Result<()>
     Ok(())
 }
 
-pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) -> Result<Printed> {
-    if image.width > i32::MAX as u32 || image.height > i32::MAX as u32 {
+pub fn print(job: &Job<'_>, pages: &[crate::PagePicture<'_, '_>]) -> Result<Printed> {
+    if pages
+        .iter()
+        .any(|(image, _)| image.width > i32::MAX as u32 || image.height > i32::MAX as u32)
+    {
         return Err(PrintError::Invalid("image too large".into()));
     }
     let dc = Dc::create(job.printer, job.settings, true)?;
     let page = dc.page()?;
-    let (x, y, w, h) = crate::device_rect(&page, rect);
-    let (bmi, bits) = dib(image)?;
+    let mut last = (0, 0, 0, 0);
     let title = wide(job.title)?;
     let output = job.output_file.map(wide).transpose()?;
     let info = DOCINFOW {
@@ -455,11 +502,6 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
         }
     };
     set_color_mode()?;
-    // SAFETY: a valid DC; HALFTONE resampling needs the brush origin reset afterwards.
-    unsafe {
-        SetStretchBltMode(dc.0, HALFTONE);
-        SetBrushOrgEx(dc.0, 0, 0, null_mut());
-    }
     // SAFETY: `info` and the strings it points to live until EndDoc/AbortDoc below.
     if unsafe { StartDocW(dc.0, &info) } <= 0 {
         return Err(last_error("starting the print job"));
@@ -470,10 +512,33 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
         unsafe { AbortDoc(dc.0) };
         e
     };
-    for _ in 0..job.copies.clamp(1, 999) {
+    for (image, rect) in (0..job.copies.clamp(1, 999)).flat_map(|_| pages.iter()) {
+        let (x, y, w, h) = crate::device_rect(&page, *rect);
+        last = (x, y, w, h);
+        let (bmi, bits) = match dib(image) {
+            Ok(d) => d,
+            Err(error) => {
+                // SAFETY: the job was started on this DC.
+                unsafe { AbortDoc(dc.0) };
+                return Err(error);
+            }
+        };
         // SAFETY: inside a started document on a valid DC.
         if unsafe { StartPage(dc.0) } <= 0 {
             return Err(fail("starting a page"));
+        }
+        // A picture already at the device's pixels is copied as it is; a scaled one is resampled
+        // with halftoning (which needs the brush origin reset). Set per page: StartPage may reset
+        // the DC's state.
+        let mode = if crate::is_device_size(image, (w, h)) {
+            COLORONCOLOR
+        } else {
+            HALFTONE
+        };
+        // SAFETY: a valid page DC and a documented stretch mode.
+        unsafe {
+            SetStretchBltMode(dc.0, mode);
+            SetBrushOrgEx(dc.0, 0, 0, null_mut());
         }
         // StartPage saves/restores DC state. Reapply the policy for each page, before pixels.
         if let Err(error) = set_color_mode() {
@@ -518,7 +583,7 @@ pub fn print(job: &Job<'_>, image: &RgbImage<'_>, rect: (f64, f64, f64, f64)) ->
         return Err(last_error("finishing the print job"));
     }
     Ok(Printed {
-        device_rect: (x, y, w, h),
+        device_rect: last,
         dpi: page.dpi,
     })
 }
